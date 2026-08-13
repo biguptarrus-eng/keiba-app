@@ -70,17 +70,14 @@ def fetch_race_list_by_date(selected_date):
         track_name = TRACK_NAMES.get(track_code, f"場{track_code}")
 
         # JRAの原則：奇数日目(1,3,5日目...)＝土曜(🟦)、偶数日目(2,4,6日目...)＝日曜(🟥)
-        is_saturday = (nichi % 2 != 0)
+        is_saturday = nichi % 2 != 0
         day_tag = "🟦【土曜】" if is_saturday else "🟥【日曜】"
 
         label = (
             f"{day_tag} {track_name} {r_num}R （第{kai}回{track_name}{nichi}日目） [ID:"
             f" {r_id}]"
         )
-        race_options[label] = {
-            "id": r_id,
-            "is_saturday": is_saturday
-        }
+        race_options[label] = {"id": r_id, "is_saturday": is_saturday}
 
     return race_options, None
 
@@ -102,7 +99,7 @@ def clean_horse_name(name_str):
 
 
 # 2. WEB出走表取得関数
-def fetch_single_race_data(race_id_or_url):
+def fetch_single_race_data(race_id_or_url, is_shinba=False):
     id_match = re.search(r"\d{12}", str(race_id_or_url))
     if not id_match:
         return None, "有効な12桁のレースIDが見つかりませんでした。"
@@ -197,7 +194,7 @@ def fetch_single_race_data(race_id_or_url):
                         "枠番": waku_val,
                         "馬番": umaban_val,
                         "馬名": c_name,
-                        "能力スコア": 70,  # デフォルト値
+                        "能力スコア": 70,  # デフォルト値（調教・血統評価値）
                     })
 
             unique_data = {}
@@ -209,11 +206,20 @@ def fetch_single_race_data(race_id_or_url):
 
             if len(final_list) >= 2:
                 res_df = pd.DataFrame(final_list)
-                styles = ["逃げ", "先行", "差し", "追込"]
                 np.random.seed(int(race_id) % 100000)
-                res_df["脚質"] = np.random.choice(
-                    styles, size=len(res_df), p=[0.15, 0.40, 0.30, 0.15]
-                )
+                
+                # 新馬戦モードの場合は「先行」主体（初走は前目が圧倒的有利なため）
+                if is_shinba:
+                    styles = ["逃げ", "先行", "差し"]
+                    res_df["脚質"] = np.random.choice(
+                        styles, size=len(res_df), p=[0.25, 0.60, 0.15]
+                    )
+                else:
+                    styles = ["逃げ", "先行", "差し", "追込"]
+                    res_df["脚質"] = np.random.choice(
+                        styles, size=len(res_df), p=[0.15, 0.40, 0.30, 0.15]
+                    )
+
                 res_df["能力スコア"] = np.random.randint(65, 85, size=len(res_df))
                 return res_df, None
 
@@ -227,9 +233,15 @@ def fetch_single_race_data(race_id_or_url):
 
 
 # 想定ペースの自動判定ロジック関数
-def auto_estimate_pace(df):
+def auto_estimate_pace(df, is_shinba=False):
     if df is None or len(df) == 0:
         return "ミドルペース（標準）", "データなし"
+
+    if is_shinba:
+        return (
+            "スローペース（前残り濃厚）",
+            "🐣 新馬戦特有：各馬控えめの競馬になりやすく、前残り傾向が顕著なため",
+        )
 
     nige_count = len(df[df["脚質"] == "逃げ"])
     senko_count = len(df[df["脚質"] == "先行"])
@@ -263,6 +275,16 @@ def auto_estimate_pace(df):
 
 # 3. サイドバー：バイアス ＆ 重視設定
 st.sidebar.header("⚙️ バイアス・展開 ＆ 重視設定")
+
+# 🐣 新馬戦独自切り替えスイッチ
+is_shinba_mode = st.sidebar.checkbox(
+    "🐣 新馬戦（メイクデビュー）モード",
+    value=False,
+    help="チェックを入れると、過去走データのない新馬戦専用の加算補正（前残り・良スタート優位）が適用されます。",
+)
+
+if is_shinba_mode:
+    st.sidebar.info("🐣 **新馬戦モード適用中**\n（調教・血統評価 ＆ 前残り有利重視）")
 
 track_bias = st.sidebar.select_slider(
     "① 当日の内外バイアス（馬場）",
@@ -302,15 +324,12 @@ if pace_mode == "✍️ 手動で指定":
 
 st.sidebar.write("---")
 power_weight = st.sidebar.slider(
-    "⚖️ 総合スコア算出時の『能力』重視度",
+    "⚖️ 総合スコア算出時の『能力（調教/血統）』重視度",
     min_value=0,
     max_value=100,
     value=50,
     step=10,
-    help=(
-        "能力指数と展開恵まれスコアの比率を調整します（例:"
-        " 50%＝半々、70%＝能力重視）。"
-    ),
+    help="能力指数と展開恵まれスコアの比率を調整します。",
 )
 
 # 4. メイン画面：レース選択
@@ -344,14 +363,12 @@ with tab1:
                 st.error(f"❌ {err}")
 
     if st.session_state.race_options:
-        # 曜日絞り込み用ラジオボタンを追加
         filter_day = st.radio(
             "📅 表示する曜日で絞り込み",
             ["🌐 すべて表示", "🟦 土曜日のみ", "🟥 日曜日のみ"],
             horizontal=True,
         )
 
-        # フィルター適用
         filtered_options = {}
         for label, info in st.session_state.race_options.items():
             if filter_day == "🟦 土曜日のみ" and not info["is_saturday"]:
@@ -398,7 +415,7 @@ with tab3:
                     "枠番": (idx // 2) + 1 if len(lines) > 8 else 1,
                     "馬番": idx + 1,
                     "馬名": clean_name[:10],
-                    "脚質": ["逃げ", "先行", "差し", "追込"][idx % 4],
+                    "脚質": "先行" if is_shinba_mode else ["逃げ", "先行", "差し", "追込"][idx % 4],
                     "能力スコア": 70,
                 })
         if parsed_data:
@@ -417,7 +434,7 @@ if "current_race_df" not in st.session_state:
 
 if fetch_pressed and target_race_id:
     with st.spinner("出走表データを解析・取得中..."):
-        fetched_df, err = fetch_single_race_data(target_race_id)
+        fetched_df, err = fetch_single_race_data(target_race_id, is_shinba=is_shinba_mode)
         if fetched_df is not None:
             st.session_state.current_race_df = fetched_df
             st.success("✅ 出走表を取得しました！")
@@ -475,9 +492,15 @@ if st.session_state.current_race_df is None:
 # 5. 脚質・能力スコアのチェック・編集 ＆ 分析実行
 if st.session_state.current_race_df is not None:
     st.write("---")
-    st.caption(
-        "💡 各馬の「脚質」を変更すると、分析実行時に想定ペースが自動で再判定されます。"
-    )
+    
+    if is_shinba_mode:
+        st.warning(
+            "🐣 **新馬戦モードON**: 「能力スコア」欄は **調教評価や血統期待度**（デフォルト70）の入力にご活用ください。"
+        )
+    else:
+        st.caption(
+            "💡 各馬の「脚質」を変更すると、分析実行時に想定ペースが自動で再判定されます。"
+        )
 
     display_cols = [
         c
@@ -498,13 +521,13 @@ if st.session_state.current_race_df is not None:
                 width="small",
             ),
             "能力スコア": st.column_config.NumberColumn(
-                "能力",
+                "能力(調教/血統)",
                 min_value=0,
                 max_value=200,
                 step=1,
                 required=True,
                 width="small",
-                help="過去実績やスピード指数（デフォルト70）",
+                help="過去実績がない新馬戦では調教指数や血統評価を反映",
             ),
         },
         num_rows="dynamic",
@@ -517,7 +540,7 @@ if st.session_state.current_race_df is not None:
 
         # --- 想定ペースの判定 ---
         if pace_mode == "🤖 脚質から自動判定":
-            expected_pace, pace_reason = auto_estimate_pace(df)
+            expected_pace, pace_reason = auto_estimate_pace(df, is_shinba=is_shinba_mode)
             st.info(f"💡 **自動判定されたペース**: 【{expected_pace}】\n({pace_reason})")
         else:
             expected_pace = manual_pace
@@ -545,6 +568,19 @@ if st.session_state.current_race_df is not None:
 
             w = row["枠番"]
             style = row["脚質"]
+
+            # 🐣 新馬戦独自補正（前残り意識＆良枠加算）
+            if is_shinba_mode:
+                if style in ["逃げ", "先行"]:
+                    score += 15
+                    reason_list.append("🐣新馬特有:初走前残り優位(+15)")
+                elif style == "追込":
+                    score -= 10
+                    reason_list.append("🐣新馬特有:初走追込厳しい(-10)")
+                
+                if w in [2, 3, 4, 5]:
+                    score += 5
+                    reason_list.append("🐣新馬特有:包まれにくい好枠(+5)")
 
             # 内外バイアス
             if "超内有利" in track_bias:
