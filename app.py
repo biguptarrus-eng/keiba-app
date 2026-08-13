@@ -26,7 +26,7 @@ TRACK_NAMES = {
 }
 
 
-# 1. 指定した日付からその日のレース一覧（race_id）を自動取得する関数
+# 1. 指定した日付から「その日当日のみ」のレース一覧（race_id）を自動取得する関数
 @st.cache_data(ttl=300)
 def fetch_race_list_by_date(selected_date):
     date_str = selected_date.strftime("%Y%m%d")
@@ -38,29 +38,39 @@ def fetch_race_list_by_date(selected_date):
         )
     }
 
-    target_urls = [
-        f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={date_str}",
-        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}",
-        f"https://db.netkeiba.com/race/list/{date_str}/",
-    ]
-
     found_ids = []
-    for url in target_urls:
-        try:
-            res = requests.get(url, headers=headers, timeout=6)
-            if res.status_code == 200:
-                text = res.content.decode("euc-jp", errors="ignore")
-                ids = re.findall(r"race_id=(\d{12})", text)
-                if not ids:
-                    ids = re.findall(r"/race/(\d{12})", text)
-                if not ids:
-                    ids = re.findall(r"20\d{10}", text)
 
-                if ids:
-                    found_ids.extend(ids)
-                    break
-        except Exception:
-            continue
+    # メイン：PC版 netkeiba の当日開催エリアからピンポイント取得
+    try:
+        url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}"
+        res = requests.get(url, headers=headers, timeout=6)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.content.decode("euc-jp", errors="ignore"), "html.parser")
+            
+            # 当日のレーステーブルエリアのみを取得（翌日分リンクの誤抽出を防止）
+            main_area = soup.find("div", class_="RaceTableArea") or soup.find("div", id="RaceTopRace")
+            if main_area:
+                links = main_area.find_all("a", href=re.compile(r"race_id=\d{12}"))
+                for a in links:
+                    m = re.search(r"race_id=(\d{12})", a["href"])
+                    if m:
+                        found_ids.append(m.group(1))
+
+        # サブ：SP版 netkeiba からのフォールバック
+        if not found_ids:
+            sp_url = f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={date_str}"
+            res_sp = requests.get(sp_url, headers=headers, timeout=6)
+            if res_sp.status_code == 200:
+                soup_sp = BeautifulSoup(res_sp.content.decode("euc-jp", errors="ignore"), "html.parser")
+                sp_area = soup_sp.find("div", class_="Race_List") or soup_sp.find("dl", class_="RaceList_Data")
+                if sp_area:
+                    links = sp_area.find_all("a", href=re.compile(r"race_id=\d{12}"))
+                    for a in links:
+                        m = re.search(r"race_id=(\d{12})", a["href"])
+                        if m:
+                            found_ids.append(m.group(1))
+    except Exception:
+        pass
 
     race_ids = list(dict.fromkeys(found_ids))
 
@@ -465,25 +475,32 @@ if st.session_state.current_race_df is not None:
         if c not in ["単勝オッズ", "力関係指数"]
     ]
 
+    # --- 📱【スマホ最適化】ヘッダー幅を限界まで絞り込んだテーブル設定 ---
     edited_df = st.data_editor(
         st.session_state.current_race_df[display_cols],
         column_config={
+            "枠番": st.column_config.NumberColumn("枠", width="small"),
+            "馬番": st.column_config.NumberColumn("馬", width="small"),
+            "馬名": st.column_config.TextColumn("馬名", width="medium"),
             "脚質": st.column_config.SelectboxColumn(
                 "脚質",
                 options=["逃げ", "先行", "差し", "追込"],
                 required=True,
+                width="small",
             ),
             "能力スコア": st.column_config.NumberColumn(
-                "能力スコア (スピード指数等)",
+                "能力",  # ヘッダーを「能力」に簡略化して幅を縮小
                 min_value=0,
                 max_value=200,
                 step=1,
                 required=True,
-                help="各馬の過去実績やスピード指数を入力",
+                width="small",
+                help="過去実績やスピード指数（デフォルト70）",
             ),
         },
         num_rows="dynamic",
         use_container_width=True,
+        hide_index=True,
     )
 
     if st.button("📊 総合分析を実行（力関係 × 展開・バイアス）"):
@@ -627,6 +644,7 @@ if st.session_state.current_race_df is not None:
         st.write("")
 
         sorted_df = df.sort_values(by="総合評価スコア", ascending=False)
+
         st.dataframe(
             sorted_df[[
                 "枠番",
@@ -639,6 +657,17 @@ if st.session_state.current_race_df is not None:
                 "総合評価スコア",
                 "分析理由",
             ]],
+            column_config={
+                "枠番": st.column_config.NumberColumn("枠", width="small"),
+                "馬番": st.column_config.NumberColumn("馬", width="small"),
+                "馬名": st.column_config.TextColumn("馬名", width="medium"),
+                "脚質": st.column_config.TextColumn("脚質", width="small"),
+                "能力スコア": st.column_config.NumberColumn("能力", width="small"),
+                "力関係指数": st.column_config.NumberColumn("力関係", width="small"),
+                "展開恵まれスコア": st.column_config.NumberColumn("展開", width="small"),
+                "総合評価スコア": st.column_config.NumberColumn("総合", width="small"),
+                "分析理由": st.column_config.TextColumn("理由", width="large"),
+            },
             use_container_width=True,
             hide_index=True,
         )
