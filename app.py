@@ -40,44 +40,62 @@ def fetch_race_list_by_date(selected_date):
 
     found_ids = []
 
-    urls = [
-        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}",
-        f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={date_str}",
-    ]
+    # ① SP版 netkeiba は指定日の開催レースのみを正確に返すため最優先取得
+    sp_url = f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={date_str}"
+    try:
+        res_sp = requests.get(sp_url, headers=headers, timeout=6)
+        if res_sp.status_code == 200:
+            soup_sp = BeautifulSoup(res_sp.content.decode("euc-jp", errors="ignore"), "html.parser")
+            links = soup_sp.find_all("a", href=re.compile(r"race_id=\d{12}"))
+            for a in links:
+                m = re.search(r"race_id=(\d{12})", a["href"])
+                if m:
+                    found_ids.append(m.group(1))
+    except Exception:
+        pass
 
-    for url in urls:
+    # ② バックアップ（PC版）
+    if not found_ids:
         try:
-            res = requests.get(url, headers=headers, timeout=6)
-            if res.status_code == 200:
-                html_text = res.content.decode("euc-jp", errors="ignore")
-                matches = re.findall(r"race_id=(\d{12})", html_text)
-                if matches:
-                    found_ids.extend(matches)
-                    break
+            pc_url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}"
+            res_pc = requests.get(pc_url, headers=headers, timeout=6)
+            if res_pc.status_code == 200:
+                soup_pc = BeautifulSoup(res_pc.content.decode("euc-jp", errors="ignore"), "html.parser")
+                main_area = soup_pc.find("div", class_="RaceTableArea") or soup_pc.find("div", id="RaceTopRace")
+                target = main_area if main_area else soup_pc
+                links = target.find_all("a", href=re.compile(r"race_id=\d{12}"))
+                for a in links:
+                    m = re.search(r"race_id=(\d{12})", a["href"])
+                    if m:
+                        found_ids.append(m.group(1))
         except Exception:
-            continue
+            pass
 
     if not found_ids:
         return {}, "該当日に開催レースが見つかりませんでした。"
 
-    # 重複除去（出現順を維持）
+    # 重複除去
     raw_unique_ids = list(dict.fromkeys(found_ids))
 
-    # 【重要】同日開催分のみを抽出するフィルタリング（翌日分の誤抽出防止）
-    # race_id仕様: YYYY(4桁) + 場(2桁) + 回日(4桁) + レース(2桁)
-    venue_day_map = {}
-    day_race_ids = []
-
+    # 【進化版フィルタ】各会場ごとに「最も出現数の多い日目（通常12R分ある当日）」を多数決で抽出
+    # race_id: YYYY(4桁) + 場(2桁) + 回日(4桁) + レース(2桁)
+    venue_day_counts = {}
     for r_id in raw_unique_ids:
-        venue = r_id[4:6]        # 競馬場コード (例: 04=新潟)
-        kai_nichi = r_id[6:10]   # 開催回・日目 (例: 0205=第2回5日目)
+        venue = r_id[4:6]
+        kai_nichi = r_id[6:10]
+        key = (venue, kai_nichi)
+        venue_day_counts[key] = venue_day_counts.get(key, 0) + 1
 
-        if venue not in venue_day_map:
-            venue_day_map[venue] = kai_nichi
+    # 会場ごとに最大のカウントを持つ (venue, kai_nichi) だけを許可リストに入れる
+    valid_keys = set()
+    venues = set(r_id[4:6] for r_id in raw_unique_ids)
+    for v in venues:
+        v_keys = [k for k in venue_day_counts.keys() if k[0] == v]
+        if v_keys:
+            best_key = max(v_keys, key=lambda k: venue_day_counts[k])
+            valid_keys.add(best_key)
 
-        # その競馬場で最初に登場した開催日（当日分）のレースのみを採用
-        if venue_day_map[venue] == kai_nichi:
-            day_race_ids.append(r_id)
+    day_race_ids = [r_id for r_id in raw_unique_ids if (r_id[4:6], r_id[6:10]) in valid_keys]
 
     race_options = {}
     for r_id in day_race_ids:
