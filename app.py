@@ -26,7 +26,7 @@ TRACK_NAMES = {
 }
 
 
-# 1. 指定した日付から「その日当日のみ」のレース一覧（race_id）を自動取得する関数
+# 1. レース一覧（race_id）を取得し、土日タグを付与する関数
 @st.cache_data(ttl=300)
 def fetch_race_list_by_date(selected_date):
     date_str = selected_date.strftime("%Y%m%d")
@@ -40,76 +40,47 @@ def fetch_race_list_by_date(selected_date):
 
     found_ids = []
 
-    # ① SP版 netkeiba は指定日の開催レースのみを正確に返すため最優先取得
-    sp_url = f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={date_str}"
-    try:
-        res_sp = requests.get(sp_url, headers=headers, timeout=6)
-        if res_sp.status_code == 200:
-            soup_sp = BeautifulSoup(res_sp.content.decode("euc-jp", errors="ignore"), "html.parser")
-            links = soup_sp.find_all("a", href=re.compile(r"race_id=\d{12}"))
-            for a in links:
-                m = re.search(r"race_id=(\d{12})", a["href"])
-                if m:
-                    found_ids.append(m.group(1))
-    except Exception:
-        pass
+    urls = [
+        f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}",
+        f"https://race.sp.netkeiba.com/?pid=race_list&kaisai_date={date_str}",
+    ]
 
-    # ② バックアップ（PC版）
-    if not found_ids:
+    for url in urls:
         try:
-            pc_url = f"https://race.netkeiba.com/top/race_list.html?kaisai_date={date_str}"
-            res_pc = requests.get(pc_url, headers=headers, timeout=6)
-            if res_pc.status_code == 200:
-                soup_pc = BeautifulSoup(res_pc.content.decode("euc-jp", errors="ignore"), "html.parser")
-                main_area = soup_pc.find("div", class_="RaceTableArea") or soup_pc.find("div", id="RaceTopRace")
-                target = main_area if main_area else soup_pc
-                links = target.find_all("a", href=re.compile(r"race_id=\d{12}"))
-                for a in links:
-                    m = re.search(r"race_id=(\d{12})", a["href"])
-                    if m:
-                        found_ids.append(m.group(1))
+            res = requests.get(url, headers=headers, timeout=6)
+            if res.status_code == 200:
+                html_text = res.content.decode("euc-jp", errors="ignore")
+                matches = re.findall(r"race_id=(\d{12})", html_text)
+                if matches:
+                    found_ids.extend(matches)
         except Exception:
-            pass
+            continue
 
-    if not found_ids:
-        return {}, "該当日に開催レースが見つかりませんでした。"
-
-    # 重複除去
     raw_unique_ids = list(dict.fromkeys(found_ids))
 
-    # 【進化版フィルタ】各会場ごとに「最も出現数の多い日目（通常12R分ある当日）」を多数決で抽出
-    # race_id: YYYY(4桁) + 場(2桁) + 回日(4桁) + レース(2桁)
-    venue_day_counts = {}
-    for r_id in raw_unique_ids:
-        venue = r_id[4:6]
-        kai_nichi = r_id[6:10]
-        key = (venue, kai_nichi)
-        venue_day_counts[key] = venue_day_counts.get(key, 0) + 1
-
-    # 会場ごとに最大のカウントを持つ (venue, kai_nichi) だけを許可リストに入れる
-    valid_keys = set()
-    venues = set(r_id[4:6] for r_id in raw_unique_ids)
-    for v in venues:
-        v_keys = [k for k in venue_day_counts.keys() if k[0] == v]
-        if v_keys:
-            best_key = max(v_keys, key=lambda k: venue_day_counts[k])
-            valid_keys.add(best_key)
-
-    day_race_ids = [r_id for r_id in raw_unique_ids if (r_id[4:6], r_id[6:10]) in valid_keys]
+    if not raw_unique_ids:
+        return {}, "該当日に開催レースが見つかりませんでした。"
 
     race_options = {}
-    for r_id in day_race_ids:
+    for r_id in raw_unique_ids:
         track_code = r_id[4:6]
         kai = int(r_id[6:8])
         nichi = int(r_id[8:10])
         r_num = int(r_id[10:12])
         track_name = TRACK_NAMES.get(track_code, f"場{track_code}")
 
+        # JRAの原則：奇数日目(1,3,5日目...)＝土曜(🟦)、偶数日目(2,4,6日目...)＝日曜(🟥)
+        is_saturday = (nichi % 2 != 0)
+        day_tag = "🟦【土曜】" if is_saturday else "🟥【日曜】"
+
         label = (
-            f"{track_name} {r_num}R （第{kai}回{track_name}{nichi}日目） [ID:"
+            f"{day_tag} {track_name} {r_num}R （第{kai}回{track_name}{nichi}日目） [ID:"
             f" {r_id}]"
         )
-        race_options[label] = r_id
+        race_options[label] = {
+            "id": r_id,
+            "is_saturday": is_saturday
+        }
 
     return race_options, None
 
@@ -373,10 +344,29 @@ with tab1:
                 st.error(f"❌ {err}")
 
     if st.session_state.race_options:
-        selected_label = st.selectbox(
-            "予想するレースを選択", list(st.session_state.race_options.keys())
+        # 曜日絞り込み用ラジオボタンを追加
+        filter_day = st.radio(
+            "📅 表示する曜日で絞り込み",
+            ["🌐 すべて表示", "🟦 土曜日のみ", "🟥 日曜日のみ"],
+            horizontal=True,
         )
-        target_race_id = st.session_state.race_options[selected_label]
+
+        # フィルター適用
+        filtered_options = {}
+        for label, info in st.session_state.race_options.items():
+            if filter_day == "🟦 土曜日のみ" and not info["is_saturday"]:
+                continue
+            if filter_day == "🟥 日曜日のみ" and info["is_saturday"]:
+                continue
+            filtered_options[label] = info["id"]
+
+        if filtered_options:
+            selected_label = st.selectbox(
+                "予想するレースを選択", list(filtered_options.keys())
+            )
+            target_race_id = filtered_options[selected_label]
+        else:
+            st.warning("選択した曜日に該当するレースがありません。")
 
 with tab2:
     st.caption("netkeibaのURL（出走表URL・結果URL等）を入力")
